@@ -4,15 +4,25 @@ import argparse
 import numpy as np
 import joblib
 import os
+from pathlib import Path
 from sklearn.linear_model import Ridge
 from lightgbm import LGBMRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import mean_squared_error, r2_score
 
 import tensorflow as tf
-from tensorflow.keras.models import Sequential # type: ignore
-from tensorflow.keras.layers import Conv1D, GlobalMaxPooling1D, Dense, Input, Flatten, Dropout # type: ignore
+from tensorflow.keras.models import Sequential  # type: ignore
+from tensorflow.keras.layers import Conv1D, GlobalMaxPooling1D, Dense, Input, Flatten, Dropout  # type: ignore
 
+from scripts.register_model_features import register_features
+
+FEATURE_NAMES = [
+    f"log_return_{i:03d}" for i in range(252)
+] + [
+    f"volume_z_{i:03d}" for i in range(252)
+] + [
+    f"price_norm_{i:03d}" for i in range(252)
+]
 
 def load_data(X_path, y_path):
     print("📦 Loading data...")
@@ -20,14 +30,12 @@ def load_data(X_path, y_path):
     y = np.load(y_path)["arr_0"].astype(np.float32)
     return X, y
 
-
 def evaluate(model, X_test, y_test):
     y_pred = model.predict(X_test).flatten()
     mse = mean_squared_error(y_test, y_pred)
     r2 = r2_score(y_test, y_pred)
     directional = np.mean((y_pred > 0) == (y_test > 0))
     return mse, r2, directional
-
 
 def train_ridge(X, y):
     X_flat = X.reshape(len(X), -1)
@@ -39,8 +47,7 @@ def train_ridge(X, y):
 
     model = Ridge(alpha=1.0)
     model.fit(X_imputed, y)
-    return (model, imputer)
-
+    return model, imputer
 
 def train_lgbm(X, y):
     print("🚀 Training LightGBM model...")
@@ -48,7 +55,6 @@ def train_lgbm(X, y):
     model = LGBMRegressor(n_estimators=100, learning_rate=0.05, n_jobs=-1)
     model.fit(X_flat, y)
     return model
-
 
 def build_cnn_model(input_shape):
     model = Sequential([
@@ -61,13 +67,11 @@ def build_cnn_model(input_shape):
     model.compile(optimizer="adam", loss="mse")
     return model
 
-
 def train_cnn(X, y):
     print("🚀 Training 1D-CNN model...")
     model = build_cnn_model((252, 3))
     model.fit(X, y, epochs=10, batch_size=256, validation_split=0.1, verbose=1)
     return model
-
 
 def build_mlp_model(input_dim):
     model = Sequential([
@@ -81,7 +85,6 @@ def build_mlp_model(input_dim):
     model.compile(optimizer="adam", loss="mse")
     return model
 
-
 def train_mlp(X, y):
     print("🚀 Training MLP model...")
     X_flat = X.reshape(len(X), -1)
@@ -89,13 +92,13 @@ def train_mlp(X, y):
     model.fit(X_flat, y, epochs=10, batch_size=256, validation_split=0.1, verbose=1)
     return model
 
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--X-path", required=True)
     parser.add_argument("--y-path", required=True)
     parser.add_argument("--model", choices=["ridge", "lgbm", "cnn", "mlp"], required=True)
     parser.add_argument("--output-path", required=True)
+    parser.add_argument("--db", default="data/kairos.duckdb", help="Path to DuckDB registry")
     args = parser.parse_args()
 
     X, y = load_data(args.X_path, args.y_path)
@@ -109,8 +112,8 @@ def main():
     if args.model == "ridge":
         model, imputer = train_ridge(X_train, y_train)
         joblib.dump((model, imputer), args.output_path)
-        X_test_flat = imputer.transform(X_test.reshape(len(X_test), -1))
-        mse, r2, directional = evaluate(model, X_test_flat, y_test)
+        X_eval = imputer.transform(X_test.reshape(len(X_test), -1))
+        mse, r2, directional = evaluate(model, X_eval, y_test)
 
     elif args.model == "lgbm":
         model = train_lgbm(X_train, y_train)
@@ -127,11 +130,13 @@ def main():
         model.save(args.output_path)
         mse, r2, directional = evaluate(model, X_test.reshape(len(X_test), -1), y_test)
 
+    model_name = Path(args.output_path).stem
+    register_features(model_name, FEATURE_NAMES, db_path=args.db)
+
     print("📈 Evaluation Results:")
     print(f"📉 MSE: {mse:.6f}")
     print(f"📊 R²: {r2:.4f}")
     print(f"📈 Directional Accuracy: {directional:.2%}")
-
 
 if __name__ == "__main__":
     main()
