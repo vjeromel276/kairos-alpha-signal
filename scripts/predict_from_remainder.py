@@ -1,0 +1,148 @@
+# scripts/predict_from_remainder.py
+
+import argparse
+import duckdb
+import numpy as np
+import joblib
+import tensorflow as tf
+import os
+import requests
+
+from pathlib import Path
+from pandas import Timestamp
+from pandas.tseries.offsets import BDay
+import pandas as pd
+
+def load_frame_from_duckdb(ticker, sep_table="sep_base", window_size=252, db_path="kairos.duckdb"):
+    con = duckdb.connect(db_path)
+
+    # Compute features on the fly from latest OHLCV data
+    query = f"""
+        WITH base AS (
+            SELECT date, closeadj, volume
+            FROM {sep_table}
+            WHERE ticker = '{ticker}'
+            ORDER BY date DESC
+            LIMIT {window_size}
+        ),
+        ordered AS (
+            SELECT * FROM base ORDER BY date ASC
+        ),
+        enriched AS (
+            SELECT
+                date,
+                LOG(closeadj / LAG(closeadj) OVER (ORDER BY date)) AS log_return,
+                (volume - AVG(volume) OVER ()) / STDDEV_POP(volume) OVER () AS volume_z,
+                closeadj / FIRST_VALUE(closeadj) OVER (ORDER BY date) AS price_norm
+            FROM ordered
+        )
+        SELECT * FROM enriched
+    """
+    df = con.execute(query).fetchdf()
+
+    if df.shape[0] < window_size:
+        print(f"⚠️ Using partial frame for {ticker} with {df.shape[0]} rows (expected {window_size})")
+
+    df = df.tail(window_size)
+    df["log_return"] = df["log_return"].fillna(0.0)
+
+    last_date = df["date"].iloc[-1]
+    X = df[["log_return", "volume_z", "price_norm"]].to_numpy().astype(np.float32)
+
+    if X.shape[0] < window_size:
+        padding = np.zeros((window_size - X.shape[0], 3), dtype=np.float32)
+        X = np.vstack([padding, X])
+
+    return X, last_date
+
+def get_next_market_date(last_date):
+    POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+    if not POLYGON_API_KEY:
+        raise EnvironmentError("POLYGON_API_KEY is not set in environment")
+
+    url = f"https://api.polygon.io/v1/marketstatus/upcoming?apiKey={POLYGON_API_KEY}"
+    res = requests.get(url)
+    if res.status_code != 200:
+        raise RuntimeError(f"Failed to fetch market calendar: {res.text}")
+
+    dates = sorted(d["date"] for d in res.json() if d["market"] == "stocks" and d["status"] == "open")
+    for d in dates:
+        if d > str(last_date.date()):
+            return d
+    raise ValueError("No future trading date found.")
+
+def predict(model_path, X):
+    ext = Path(model_path).suffix
+    if ext == ".joblib":
+        model_obj = joblib.load(model_path)
+        if isinstance(model_obj, tuple):
+            model, imputer = model_obj
+            X_input = imputer.transform(X.reshape(1, -1))
+        else:
+            model = model_obj
+            X_input = X.reshape(1, -1)
+        y_pred = model.predict(X_input)
+    elif ext == ".keras":
+        model = tf.keras.models.load_model(model_path) # type: ignore
+        y_pred = model.predict(X.reshape(1, 252, 3))
+    else:
+        raise ValueError(f"Unsupported model format: {ext}")
+    return y_pred[0] if isinstance(y_pred, np.ndarray) else y_pred
+
+def log_prediction_to_duckdb(ticker, model_name, date, prediction, last_date, db_path, table="live_predictions"):
+    con = duckdb.connect(db_path)
+    con.execute(f"""
+        CREATE TABLE IF NOT EXISTS {table} (
+            ticker TEXT,
+            model TEXT,
+            prediction_date DATE,
+            predicted_return DOUBLE,
+            source_date DATE,
+            run_ts TIMESTAMP DEFAULT now()
+        )
+    """)
+    con.execute(f"""
+        INSERT INTO {table} (ticker, model, prediction_date, predicted_return, source_date)
+        VALUES (?, ?, ?, ?, ?)
+    """, (ticker, model_name, str(date), float(prediction), str(last_date)))
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("ticker", nargs="?", help="Ticker symbol (e.g., AAPL)")
+    parser.add_argument("model_path", help="Path to .joblib or .keras model")
+    parser.add_argument("--db", default="kairos.duckdb", help="Path to DuckDB database")
+    parser.add_argument("--log-table", default="live_predictions", help="Table name to log prediction")
+    parser.add_argument("--batch", action="store_true", help="Flag to indicate batch prediction mode")
+    parser.add_argument("--universe", help="Path to CSV with tickers to predict in batch mode")
+    args = parser.parse_args()
+
+    tickers = [args.ticker] if not args.batch else list(pd.read_csv(args.universe)["ticker"].unique())
+    table = args.log_table if not args.batch else "batch_predictions"
+    model_name = Path(args.model_path).stem
+
+    for ticker in tickers:
+        try:
+            X, last_date = load_frame_from_duckdb(ticker, db_path=args.db)
+            y_pred = predict(args.model_path, X)
+
+            try:
+                next_trading_day = get_next_market_date(last_date)
+            except Exception:
+                next_trading_day = (Timestamp(last_date) + BDay(1)).date()
+
+            print(f"🔮 Prediction for {ticker} on {next_trading_day}: {y_pred:.6f} (log return from {last_date.date()})")
+
+            log_prediction_to_duckdb(
+                ticker=ticker,
+                model_name=model_name,
+                date=next_trading_day,
+                prediction=y_pred,
+                last_date=last_date,
+                db_path=args.db,
+                table=table
+            )
+        except Exception as e:
+            print(f"❌ Failed prediction for {ticker}: {e}")
+
+if __name__ == "__main__":
+    main()
