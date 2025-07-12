@@ -14,6 +14,10 @@ __pycache__/
 *.joblib
 *.h5
 *.keras
+data/
+feature_sets/
+original_data/
+daily_downloads/
 
 # DuckDB DB + temp files
 *.duckdb
@@ -32,3 +36,4 @@ logs/
 Thumbs.db
 # Temporary files
 *.tmp
+*.bak
