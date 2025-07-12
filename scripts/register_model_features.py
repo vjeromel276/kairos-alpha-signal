@@ -31,6 +31,17 @@ def register_features(model_name, features, db_path):
 
     print(f"✅ Registered {len(features)} features for model '{model_name}'")
 
+def get_model_feature_list(model_name, db_path):
+    con = duckdb.connect(db_path)
+    query = """
+        SELECT feature_name
+        FROM model_feature_registry
+        WHERE model = ?
+        ORDER BY feature_index
+    """
+    result = con.execute(query, (model_name,)).fetchall()
+    return [row[0] for row in result]
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, help="Model name (e.g., ridge_2025-07-11)")

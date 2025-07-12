@@ -7,13 +7,14 @@ import joblib
 import tensorflow as tf
 import os
 import requests
-
 from pathlib import Path
 from pandas import Timestamp
 from pandas.tseries.offsets import BDay
 import pandas as pd
 
-def load_frame_from_duckdb(ticker, sep_table="sep_base", window_size=252, db_path="kairos.duckdb"):
+from scripts.register_model_features import get_model_feature_list
+
+def load_frame_from_duckdb(ticker, sep_table="sep_base", window_size=252, db_path="kairos.duckdb", feature_names=None):
     con = duckdb.connect(db_path)
 
     # Compute features on the fly from latest OHLCV data
@@ -45,7 +46,6 @@ def load_frame_from_duckdb(ticker, sep_table="sep_base", window_size=252, db_pat
 
     df = df.tail(window_size)
     df["log_return"] = df["log_return"].fillna(0.0)
-
     last_date = df["date"].iloc[-1]
     X = df[["log_return", "volume_z", "price_norm"]].to_numpy().astype(np.float32)
 
@@ -83,7 +83,7 @@ def predict(model_path, X):
             X_input = X.reshape(1, -1)
         y_pred = model.predict(X_input)
     elif ext == ".keras":
-        model = tf.keras.models.load_model(model_path) # type: ignore
+        model = tf.keras.models.load_model(model_path)  # type: ignore
         y_pred = model.predict(X.reshape(1, 252, 3))
     else:
         raise ValueError(f"Unsupported model format: {ext}")
