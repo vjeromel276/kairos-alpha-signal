@@ -85,10 +85,16 @@ def predict(model_path, X):
         y_pred = model.predict(X_input)
     elif ext == ".keras":
         model = tf.keras.models.load_model(model_path)  # type: ignore
-        y_pred = model.predict(X.reshape(1, 252, 3))
+        input_shape = model.input_shape
+        if input_shape[-1] == 3:
+            X_input = X.reshape(1, 252, 3)
+        else:
+            X_input = X.reshape(1, -1)
+        y_pred = model.predict(X_input)
     else:
         raise ValueError(f"Unsupported model format: {ext}")
     return y_pred[0] if isinstance(y_pred, np.ndarray) else y_pred
+
 
 def log_prediction_to_duckdb(ticker, model_name, date, prediction, last_date, db_path, table="live_predictions", run_id="unknown", run_note=None):
     con = duckdb.connect(db_path)
