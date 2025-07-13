@@ -1,8 +1,7 @@
 """
 price_shape_features.py
 
-Extracts candlestick shape and gap-related features from OHLCV data to capture
-short-term market psychology and price pressure.
+Extracts candlestick shape and gap-related features from OHLCV data in DuckDB.
 
 Features:
 - Candle body, wick sizes
@@ -10,50 +9,59 @@ Features:
 - Gap up/down (absolute and %)
 
 Input:
-    data/base/sep_base.parquet
+    DuckDB table: sep_base
 
 Output:
-    scripts/feature_matrices/<YYYY-MM-DD>_price_shape_features.parquet
+    DuckDB table: feat_price_shape
 
 To run:
-    python scripts/features/price_shape_features.py
+    python scripts/features/price_shape_features.py --db data/kairos.duckdb
 """
 
+import duckdb
 import pandas as pd
-import numpy as np
-from pathlib import Path
-from datetime import datetime
+import argparse
 
-# Paths
-INPUT_PATH = Path("data/base/sep_base.parquet")
-OUTPUT_DIR = Path("scripts/feature_matrices/")
-TODAY = datetime.today().strftime("%Y-%m-%d")
-OUTPUT_PATH = OUTPUT_DIR / f"{TODAY}_price_shape_features.parquet"
+def compute_price_shape_features(con):
+    df = con.execute("SELECT ticker, date, open, high, low, close FROM sep_base ORDER BY ticker, date").fetchdf()
 
-# Load and sort
-df = pd.read_parquet(INPUT_PATH)
-df = df.sort_values(["ticker", "date"])
+    # Candlestick components
+    df["body_size"] = (df["close"] - df["open"]).abs()
+    df["upper_wick"] = df["high"] - df[["open", "close"]].max(axis=1)
+    df["lower_wick"] = df[["open", "close"]].min(axis=1) - df["low"]
+    df["candle_range"] = df["high"] - df["low"]
 
-# Candlestick components
-df["body_size"] = (df["close"] - df["open"]).abs()
-df["upper_wick"] = df["high"] - df[["open", "close"]].max(axis=1)
-df["lower_wick"] = df[["open", "close"]].min(axis=1) - df["low"]
-df["candle_range"] = df["high"] - df["low"]
+    # Ratios
+    df["body_pct_of_range"] = df["body_size"] / df["candle_range"]
+    df["upper_wick_pct"] = df["upper_wick"] / df["candle_range"]
+    df["lower_wick_pct"] = df["lower_wick"] / df["candle_range"]
 
-# Ratios to range
-df["body_pct_of_range"] = df["body_size"] / df["candle_range"]
-df["upper_wick_pct"] = df["upper_wick"] / df["candle_range"]
-df["lower_wick_pct"] = df["lower_wick"] / df["candle_range"]
+    # Gap features
+    df["prev_close"] = df.groupby("ticker")["close"].shift(1)
+    df["gap_open"] = df["open"] - df["prev_close"]
+    df["gap_pct"] = df["gap_open"] / df["prev_close"]
 
-# Previous close for gap analysis
-df["prev_close"] = df.groupby("ticker")["close"].shift(1)
-df["gap_open"] = df["open"] - df["prev_close"]
-df["gap_pct"] = df["gap_open"] / df["prev_close"]
+    df = df.dropna()
 
-# Clean
-df = df.dropna()
+    return df[[
+        "ticker", "date",
+        "body_size", "upper_wick", "lower_wick", "candle_range",
+        "body_pct_of_range", "upper_wick_pct", "lower_wick_pct",
+        "gap_open", "gap_pct"
+    ]]
 
-# Save
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-df.to_parquet(OUTPUT_PATH, index=False)
-print(f"Price shape features saved to {OUTPUT_PATH}")
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--db", required=True, help="Path to DuckDB database")
+    args = parser.parse_args()
+
+    con = duckdb.connect(args.db)
+    con.execute("DROP TABLE IF EXISTS feat_price_shape")
+
+    df_feat = compute_price_shape_features(con)
+    con.execute("CREATE TABLE feat_price_shape AS SELECT * FROM df_feat")
+
+    print(f"✅ Saved {len(df_feat):,} rows to feat_price_shape table in {args.db}")
+
+if __name__ == "__main__":
+    main()
