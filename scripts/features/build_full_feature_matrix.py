@@ -1,75 +1,82 @@
 """
 build_full_feature_matrix.py
 
-Merges all modular feature blocks and targets into a single feature matrix
-filtered by a midcap+ ticker universe.
+Joins all feat_* tables + targets into a training-ready matrix.
+Filters to a user-specified universe CSV.
 
 Usage:
-    python scripts/features/build_full_feature_matrix.py --date 2025-07-03
+    python scripts/features/build_full_feature_matrix.py \
+        --db data/kairos.duckdb \
+        --date 2025-07-13 \
+        --universe scripts/sep_dataset/feature_sets/midcap_and_up_ticker_universe_2025-07-13.csv
 """
 
-import polars as pl
+import duckdb
+import pandas as pd
 from pathlib import Path
-from datetime import datetime
 import argparse
 
-# ---- CLI
-parser = argparse.ArgumentParser()
-parser.add_argument("--date", required=True, help="Date string (YYYY-MM-DD) to load feature files")
-args = parser.parse_args()
-date_str = args.date
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--db", required=True, help="Path to DuckDB database")
+    parser.add_argument("--date", required=True, help="Date string (YYYY-MM-DD)")
+    parser.add_argument("--universe", required=True, help="Path to ticker universe CSV")
+    args = parser.parse_args()
 
-# ---- Paths
-DATA_DIR = Path("scripts/feature_matrices/")
-UNIVERSE_PATH = Path(f"scripts/sep_dataset/feature_sets/midcap_and_up_ticker_universe_{date_str}.csv")
-OUTPUT_PATH = DATA_DIR / f"{date_str}_full_feature_matrix.parquet"
+    con = duckdb.connect(args.db)
 
-# ---- Feature blocks to merge
-feature_files = [
-    f"{date_str}_price_action_features.parquet",
-    f"{date_str}_volume_volatility_features.parquet",
-    f"{date_str}_trend_features.parquet",
-    f"{date_str}_price_shape_features.parquet",
-    f"{date_str}_statistical_features.parquet",
-    f"{date_str}_targets.parquet",
-]
+    # Load ticker universe dynamically
+    print(f"📂 Loading ticker universe: {args.universe}")
+    universe_df = pd.read_csv(args.universe)
+    con.execute("CREATE OR REPLACE TEMP TABLE ticker_universe AS SELECT * FROM universe_df")
 
-# ---- Load universe
-print(f"📂 Loading ticker universe: {UNIVERSE_PATH}")
-tickers = pl.read_csv(UNIVERSE_PATH).select("ticker")
+    # Discover feat_* tables
+    tables = con.execute("SHOW TABLES").fetchdf()["name"].tolist()
+    feature_tables = [t for t in tables if t.startswith("feat_")]
 
-# ---- Merge feature blocks
-print("🔗 Merging feature blocks with Polars...")
-df = pl.read_parquet(DATA_DIR / feature_files[0])
-start_dates = df.select("date").unique().sort("date").tail(1)
-start_row_count = df.height
+    if not feature_tables:
+        raise RuntimeError("❌ No feat_* tables found in DuckDB")
 
-for f in feature_files[1:]:
-    next_df = pl.read_parquet(DATA_DIR / f)
+    print(f"🔍 Found {len(feature_tables)} feature tables: {feature_tables}")
 
-    # Drop duplicate columns except for ticker/date
-    dupes = [col for col in next_df.columns if col in df.columns and col not in ("ticker", "date")]
-    if dupes:
-        print(f"⚠️ Dropping duplicate columns from {f}: {dupes}")
-        next_df = next_df.drop(dupes)
+    # Start with the first table
+    base = feature_tables[0]
+    join_query = f"SELECT * FROM {base}"
 
-    df = df.join(next_df, on=["ticker", "date"], how="left")
+    for t in feature_tables[1:]:
+        cols = con.execute(f"PRAGMA table_info('{t}')").fetchdf()
+        dupes = [c for c in cols["name"] if c in ("ticker", "date")]
+        select_cols = ", ".join([f"{t}.{c}" for c in cols["name"] if c not in dupes])
+        join_query = f"""
+            SELECT *
+            FROM ({join_query}) AS base
+            LEFT JOIN (
+                SELECT ticker, date, {select_cols}
+                FROM {t}
+            ) AS {t}
+            USING (ticker, date)
+        """
 
-# ---- Filter to ticker universe
-df = df.join(tickers, on="ticker", how="inner")
+    # Final query with universe filter
+    final_query = f"""
+        SELECT *
+        FROM ({join_query}) AS merged
+        INNER JOIN ticker_universe USING (ticker)
+        WHERE ticker IS NOT NULL AND date IS NOT NULL
+    """
 
-# ---- Optional cleaning (retain rows with essential fields only)
-df = df.filter(pl.col("date").is_not_null() & pl.col("ticker").is_not_null())
+    df = con.execute(final_query).fetchdf()
+    print(f"✅ Final matrix: {df.shape[0]:,} rows × {df.shape[1]} columns")
 
-# ---- Report live date preservation
-final_dates = df.select("date").unique().sort("date").tail(1)
-if start_dates.item() != final_dates.item():
-    start_dates = start_dates.item()
-    final_dates = final_dates.item()
-    print(f"⚠️ Most recent date dropped: had {start_dates}, now {final_dates}")
+    # Save to table + snapshot
+    con.execute("DROP TABLE IF EXISTS feat_matrix")
+    con.execute("CREATE TABLE feat_matrix AS SELECT * FROM df")
 
-print(f"✅ Final matrix: {df.height:,} rows × {df.width} columns")
+    output_path = Path(f"scripts/feature_matrices/{args.date}_full_feature_matrix.parquet")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(output_path, index=False)
 
-# ---- Save
-df.write_parquet(OUTPUT_PATH)
-print(f"💾 Saved full matrix to: {OUTPUT_PATH}")
+    print(f"💾 Saved feature matrix to: {output_path}")
+
+if __name__ == "__main__":
+    main()
