@@ -2,6 +2,7 @@
 
 import argparse
 import duckdb
+from matplotlib import ticker
 import numpy as np
 import joblib
 import tensorflow as tf
@@ -83,8 +84,18 @@ def predict(model_path, X):
             X_input = X.reshape(1, -1)
         y_pred = model.predict(X_input)
     elif ext == ".keras":
-        model = tf.keras.models.load_model(model_path)  # type: ignore
-        y_pred = model.predict(X.reshape(1, 252, 3))
+        model = tf.keras.models.load_model(model_path) # type: ignore
+        # Decide input shape
+        input_shape = model.input_shape  # e.g., (None, 252, 3) or (None, 756)
+
+        if len(input_shape) == 3:
+            # CNN
+            X_input = X.reshape(1, 252, 3)
+        else:
+            # MLP
+            X_input = X.reshape(1, -1)
+
+        y_pred = model.predict(X_input)
     else:
         raise ValueError(f"Unsupported model format: {ext}")
     return y_pred[0] if isinstance(y_pred, np.ndarray) else y_pred
@@ -130,7 +141,9 @@ def main():
             except Exception:
                 next_trading_day = (Timestamp(last_date) + BDay(1)).date()
 
-            print(f"🔮 Prediction for {ticker} on {next_trading_day}: {y_pred:.6f} (log return from {last_date.date()})")
+            pred_value = float(np.ravel(y_pred)[0])  # works for scalar, [[x]], etc.
+            print(f"🔮 Prediction for {ticker} on {next_trading_day}: {pred_value:.6f} (log return from {last_date.date()})")
+
 
             log_prediction_to_duckdb(
                 ticker=ticker,
