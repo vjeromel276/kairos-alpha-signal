@@ -1,72 +1,75 @@
 """
 volume_volatility_features.py
 
-Generates volume- and volatility-based features from the base SEP OHLCV dataset.
-This script builds on the gold-standard price and volume data to compute indicators
-of crowd activity (volume surges), liquidity, and risk (volatility) over short
-and medium time frames.
+Computes volume and volatility-based features from sep_base table in DuckDB.
 
-Features engineered include:
-- Volume z-score (21-day)
+Features:
+- Volume z-score (21d)
 - Dollar volume (close * volume)
 - Volume % change from previous day
-- Rolling return standard deviations (5d, 21d)
+- Rolling return std dev (5d, 21d)
 - Average True Range (ATR 14d)
 
 Input:
-    data/base/sep_base.parquet
+    DuckDB table: sep_base
 
 Output:
-    scripts/feature_matrices/<YYYY-MM-DD>_volume_volatility_features.parquet
+    DuckDB table: feat_volume_volatility
 
 To run:
-    python scripts/features/volume_volatility_features.py
+    python scripts/features/volume_volatility_features.py --db data/kairos.duckdb
 """
 
+import duckdb
 import pandas as pd
-import numpy as np
-from pathlib import Path
-from datetime import datetime
+import argparse
 
-# Paths
-INPUT_PATH = Path("data/base/sep_base.parquet")
-OUTPUT_DIR = Path("scripts/feature_matrices/")
-TODAY = datetime.today().strftime("%Y-%m-%d")
-OUTPUT_PATH = OUTPUT_DIR / f"{TODAY}_volume_volatility_features.parquet"
+def compute_volume_vol_features(con):
+    df = con.execute("SELECT ticker, date, close, high, low, volume FROM sep_base ORDER BY ticker, date").fetchdf()
 
-# Load and sort
-df = pd.read_parquet(INPUT_PATH)
-df = df.sort_values(["ticker", "date"])
+    # Dollar volume
+    df["dollar_volume"] = df["close"] * df["volume"]
 
-# Dollar volume
-df["dollar_volume"] = df["close"] * df["volume"]
+    # Volume z-score (21d rolling)
+    df["vol_zscore_21d"] = (
+        df.groupby("ticker")["volume"]
+        .transform(lambda x: (x - x.rolling(21).mean()) / x.rolling(21).std())
+    )
 
-# Volume z-score (21d rolling)
-df["vol_zscore_21d"] = (
-    df.groupby("ticker")["volume"]
-    .transform(lambda x: (x - x.rolling(21).mean()) / x.rolling(21).std())
-)
+    # Volume % change
+    df["volume_pct_change_1d"] = df.groupby("ticker")["volume"].pct_change()
 
-# Volume % change from previous day
-df["volume_pct_change_1d"] = df.groupby("ticker")["volume"].pct_change()
+    # Daily return
+    df["ret_1d"] = df.groupby("ticker")["close"].pct_change()
 
-# Daily returns for volatility calcs
-df["ret_1d"] = df.groupby("ticker")["close"].pct_change()
+    # Rolling volatility
+    df["ret_std_5d"] = df.groupby("ticker")["ret_1d"].transform(lambda x: x.rolling(5).std())
+    df["ret_std_21d"] = df.groupby("ticker")["ret_1d"].transform(lambda x: x.rolling(21).std())
 
-# Rolling return standard deviations (volatility)
-df["ret_std_5d"] = df.groupby("ticker")["ret_1d"].transform(lambda x: x.rolling(5).std())
-df["ret_std_21d"] = df.groupby("ticker")["ret_1d"].transform(lambda x: x.rolling(21).std())
+    # ATR (14d average true range)
+    df["true_range"] = df["high"] - df["low"]
+    df["atr_14d"] = df.groupby("ticker")["true_range"].transform(lambda x: x.rolling(14).mean())
 
-# True range: high - low
-df["true_range"] = df["high"] - df["low"]
+    df = df.dropna()
 
-# ATR (Average True Range) over 14 days
-df["atr_14d"] = df.groupby("ticker")["true_range"].transform(lambda x: x.rolling(14).mean())
+    return df[[
+        "ticker", "date",
+        "dollar_volume", "vol_zscore_21d", "volume_pct_change_1d",
+        "ret_std_5d", "ret_std_21d", "atr_14d"
+    ]]
 
-# Final cleanup
-df = df.dropna()
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--db", required=True, help="Path to DuckDB database")
+    args = parser.parse_args()
 
-# Save
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-df.to_parquet(OUTPUT_PATH, index=False)
-print(f"Volume/volatility features saved to {OUTPUT_PATH}")
+    con = duckdb.connect(args.db)
+    con.execute("DROP TABLE IF EXISTS feat_volume_volatility")
+
+    df_feat = compute_volume_vol_features(con)
+    con.execute("CREATE TABLE feat_volume_volatility AS SELECT * FROM df_feat")
+
+    print(f"✅ Saved {len(df_feat):,} rows to feat_volume_volatility in {args.db}")
+
+if __name__ == "__main__":
+    main()
