@@ -2,62 +2,63 @@
 price_action_features.py
 
 Generates price action and momentum-based features from the base SEP OHLCV dataset.
-This script loads the gold-standard price dataset (1998–present), computes a
-set of canonical derived features based on price action, and saves the resulting
-feature matrix as a dated `.parquet` file.
 
-Features engineered include:
+Features:
 - Daily returns
 - Rolling N-day returns (e.g., 5d, 21d)
 - Price ratios (high/low, close/open)
 - True range and price range percentage
 
 Input:
-    data/base/sep_base.parquet (filtered for 100/100 coverage, ~1850 tickers)
+    DuckDB table: sep_base
 
 Output:
-    scripts/feature_matrices/<YYYY-MM-DD>_feature_matrix.parquet
+    DuckDB table: feat_price_action
 
 To run:
-    python scripts/features/price_action_features.py
+    python scripts/features/price_action_features.py --db data/kairos.duckdb
 """
 
+import duckdb
 import pandas as pd
-import numpy as np
-from pathlib import Path
-from datetime import datetime
+import argparse
 
-# Paths
-INPUT_PATH = Path("data/base/sep_base.parquet")
-OUTPUT_DIR = Path("scripts/feature_matrices/")
-TODAY = datetime.today().strftime("%Y-%m-%d")
-OUTPUT_PATH = OUTPUT_DIR / f"{TODAY}_price_action_features.parquet"
+def compute_price_action_features(con):
+    df = con.execute("SELECT ticker, date, open, high, low, close FROM sep_base ORDER BY ticker, date").fetchdf()
 
-# Load gold dataset
-df = pd.read_parquet(INPUT_PATH)
+    # Compute returns
+    df["ret_1d"] = df.groupby("ticker")["close"].pct_change()
+    df["ret_5d"] = df.groupby("ticker")["close"].pct_change(5)
+    df["ret_21d"] = df.groupby("ticker")["close"].pct_change(21)
 
-# Sort for rolling ops
-df = df.sort_values(["ticker", "date"])
+    # Price ratios
+    df["hl_ratio"] = df["high"] / df["low"]
+    df["co_ratio"] = df["close"] / df["open"]
 
-# Daily return
-df["ret_1d"] = df.groupby("ticker")["close"].pct_change()
+    # True range and range percentage
+    df["true_range"] = df["high"] - df["low"]
+    df["range_pct"] = (df["high"] - df["low"]) / df["open"]
 
-# Rolling returns
-df["ret_5d"] = df.groupby("ticker")["close"].pct_change(5)
-df["ret_21d"] = df.groupby("ticker")["close"].pct_change(21)
+    df = df.dropna()
 
-# Price ratios
-df["hl_ratio"] = df["high"] / df["low"]
-df["co_ratio"] = df["close"] / df["open"]
+    return df[[
+        "ticker", "date",
+        "ret_1d", "ret_5d", "ret_21d",
+        "hl_ratio", "co_ratio", "true_range", "range_pct"
+    ]]
 
-# True range and price range %
-df["true_range"] = df["high"] - df["low"]
-df["range_pct"] = (df["high"] - df["low"]) / df["open"]
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--db", required=True, help="Path to DuckDB database")
+    args = parser.parse_args()
 
-# Drop rows with nulls from pct_change
-df = df.dropna()
+    con = duckdb.connect(args.db)
+    con.execute("DROP TABLE IF EXISTS feat_price_action")
 
-# Save
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-df.to_parquet(OUTPUT_PATH, index=False)
-print(f"Feature matrix saved to {OUTPUT_PATH}")
+    df_feat = compute_price_action_features(con)
+    con.execute("CREATE TABLE feat_price_action AS SELECT * FROM df_feat")
+
+    print(f"✅ Saved {len(df_feat):,} rows to feat_price_action table in {args.db}")
+
+if __name__ == "__main__":
+    main()
