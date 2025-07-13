@@ -1,57 +1,53 @@
 """
 generate_targets.py
 
-Generates forward-looking return-based targets for supervised model training.
-Includes both regression (e.g. next-day return) and classification labels (e.g. 5-day up/down).
+Creates forward-looking regression and classification targets from DuckDB sep_base.
 
 Targets:
 - ret_1d_f: Next day return
 - ret_5d_f: 5-day forward return
-- label_5d_up: 1 if ret_5d_f > 0, else 0
+- label_5d_up: Classification label: 1 if ret_5d_f > 0 else 0
 
 Input:
-    data/base/sep_base.parquet
+    DuckDB table: sep_base
 
 Output:
-    scripts/feature_matrices/<YYYY-MM-DD>_targets.parquet
+    DuckDB table: feat_targets
 
 To run:
-    python scripts/features/generate_targets.py --date 2025-07-03
+    python scripts/features/generate_targets.py --db data/kairos.duckdb
 """
 
+import duckdb
 import pandas as pd
-import numpy as np
-from pathlib import Path
-from datetime import datetime
 import argparse
 
-# ---- CLI ----
-parser = argparse.ArgumentParser()
-parser.add_argument('--date', type=str, required=True, help="Date label for output file (YYYY-MM-DD)")
-args = parser.parse_args()
+def generate_targets(con):
+    df = con.execute("""
+        SELECT ticker, date, close
+        FROM sep_base
+        ORDER BY ticker, date
+    """).fetchdf()
 
-try:
-    datetime.strptime(args.date, "%Y-%m-%d")
-except ValueError:
-    raise ValueError("Date must be in YYYY-MM-DD format")
+    df["ret_1d_f"] = df.groupby("ticker")["close"].shift(-1) / df["close"] - 1
+    df["ret_5d_f"] = df.groupby("ticker")["close"].shift(-5) / df["close"] - 1
+    df["label_5d_up"] = (df["ret_5d_f"] > 0).astype("Int8")
+    df = df.dropna()
 
-# ---- Paths ----
-INPUT_PATH = Path("data/base/sep_base.parquet")
-OUTPUT_DIR = Path("scripts/feature_matrices/")
-OUTPUT_PATH = OUTPUT_DIR / f"{args.date}_targets.parquet"
+    return df[["ticker", "date", "ret_1d_f", "ret_5d_f", "label_5d_up"]]
 
-# ---- Load and Sort ----
-df = pd.read_parquet(INPUT_PATH)
-df = df.sort_values(["ticker", "date"])
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--db", required=True, help="Path to DuckDB database")
+    args = parser.parse_args()
 
-# ---- Forward Returns ----
-df["ret_1d_f"] = df.groupby("ticker")["close"].shift(-1) / df["close"] - 1
-df["ret_5d_f"] = df.groupby("ticker")["close"].shift(-5) / df["close"] - 1
-df["label_5d_up"] = np.where(df["ret_5d_f"].notna(), (df["ret_5d_f"] > 0).astype(int), np.nan)
+    con = duckdb.connect(args.db)
+    con.execute("DROP TABLE IF EXISTS feat_targets")
 
-print(f"🔍 Targets generated with {df['ret_5d_f'].isna().sum():,} rows lacking 5-day forward return")
+    df_targets = generate_targets(con)
+    con.execute("CREATE TABLE feat_targets AS SELECT * FROM df_targets")
 
-# ---- Save
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-df.to_parquet(OUTPUT_PATH, index=False)
-print(f"✅ Target matrix saved to {OUTPUT_PATH}")
+    print(f"✅ Saved {len(df_targets):,} rows to feat_targets in {args.db}")
+
+if __name__ == "__main__":
+    main()
