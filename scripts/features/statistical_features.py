@@ -11,86 +11,71 @@ Features:
 - Simple mean-reversion flag
 
 Input:
-    data/base/sep_base.parquet
+    DuckDB table: sep_base
 
 Output:
-    scripts/feature_matrices/<YYYY-MM-DD>_statistical_features.parquet
+    DuckDB table: feat_stat
 
 To run:
-    python scripts/features/statistical_features.py
+    python scripts/features/statistical_features.py --db data/kairos.duckdb
 """
 
+import duckdb
 import pandas as pd
 import numpy as np
-from pathlib import Path
-from datetime import datetime
+import argparse
 
-# Optional numba speed-up
-try:
-    from numba import njit
-    USE_NUMBA = True
-except ImportError:
-    USE_NUMBA = False
+def compute_statistical_features(con):
+    df = con.execute("SELECT ticker, date, close FROM sep_base ORDER BY ticker, date").fetchdf()
+    df["ret_1d"] = df.groupby("ticker")["close"].pct_change()
 
-# Paths
-INPUT_PATH = Path("data/base/sep_base.parquet")
-OUTPUT_DIR = Path("scripts/feature_matrices/")
-TODAY = datetime.today().strftime("%Y-%m-%d")
-OUTPUT_PATH = OUTPUT_DIR / f"{TODAY}_statistical_features.parquet"
+    def compute_group_stats(group):
+        group["close_mean_21d"] = group["close"].rolling(21).mean()
+        group["close_std_21d"] = group["close"].rolling(21).std()
+        group["ret_1d_std_21d"] = group["ret_1d"].rolling(21).std()
+        group["rolling_max_21d"] = group["close"].rolling(21).max()
+        return group
 
-# Load and sort
-df = pd.read_parquet(INPUT_PATH)
-df = df.sort_values(["ticker", "date"])
+    df = df.groupby("ticker", group_keys=False).apply(compute_group_stats)
 
-# Compute daily return
-df["ret_1d"] = df.groupby("ticker", group_keys=False)["close"].pct_change()
+    df["close_zscore_21d"] = (df["close"] - df["close_mean_21d"]) / df["close_std_21d"]
+    df["ret_1d_zscore_21d"] = df["ret_1d"] / df["ret_1d_std_21d"]
 
-# Compute rolling mean, std, and max in a single pass per group
-def compute_group_stats(group):
-    group["close_mean_21d"] = group["close"].rolling(21).mean()
-    group["close_std_21d"] = group["close"].rolling(21).std()
-    group["ret_1d_std_21d"] = group["ret_1d"].rolling(21).std()
-    group["rolling_max_21d"] = group["close"].rolling(21).max()
-    return group
-
-df = df.groupby("ticker", group_keys=False).apply(compute_group_stats)
-
-# Z-scores
-df["close_zscore_21d"] = (df["close"] - df["close_mean_21d"]) / df["close_std_21d"]
-df["ret_1d_zscore_21d"] = df["ret_1d"] / df["ret_1d_std_21d"]
-
-# Efficient rolling percentile rank
-if USE_NUMBA:
-    @njit
-    def fast_percentile_rank(arr):
-        temp = np.argsort(arr)
-        ranks = np.empty(len(arr), dtype=np.int64)
-        for i in range(len(arr)):
-            ranks[temp[i]] = i
-        return ranks[-1] / (len(arr) - 1) if len(arr) > 1 else 0.5
-else:
-    def fast_percentile_rank(arr):
-        temp = arr.argsort()
+    def rolling_percentile_rank(x):
+        temp = x.argsort()
         ranks = temp.argsort()
-        return ranks[-1] / (len(arr) - 1) if len(arr) > 1 else 0.5
+        return ranks[-1] / (len(x) - 1) if len(x) > 1 else 0.5
 
-df["ret_1d_rank_21d"] = (
-    df.groupby("ticker")["ret_1d"]
-    .transform(lambda x: x.rolling(21).apply(fast_percentile_rank, raw=True))
-)
+    df["ret_1d_rank_21d"] = (
+        df.groupby("ticker")["ret_1d"]
+        .transform(lambda x: x.rolling(21).apply(rolling_percentile_rank, raw=True))
+    )
 
-# Price % from recent high
-df["price_pct_from_rolling_max_21d"] = (
-    (df["close"] - df["rolling_max_21d"]) / df["rolling_max_21d"]
-)
+    df["price_pct_from_rolling_max_21d"] = (
+        (df["close"] - df["rolling_max_21d"]) / df["rolling_max_21d"]
+    )
 
-# Mean reversion flag
-df["mean_reversion_flag"] = (df["close_zscore_21d"] < -2.0).astype(int)
+    df["mean_reversion_flag"] = (df["close_zscore_21d"] < -2.0).astype(int)
 
-# Drop any rows with nulls from rolling ops
-df = df.dropna()
+    df = df.dropna()
 
-# Save
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-df.to_parquet(OUTPUT_PATH, index=False)
-print(f"Statistical features saved to {OUTPUT_PATH}")
+    return df[[
+        "ticker", "date",
+        "close_zscore_21d", "ret_1d_zscore_21d", "ret_1d_rank_21d",
+        "price_pct_from_rolling_max_21d", "mean_reversion_flag"
+    ]]
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--db", required=True, help="Path to DuckDB database")
+    args = parser.parse_args()
+
+    con = duckdb.connect(args.db)
+    con.execute("DROP TABLE IF EXISTS feat_stat")
+
+    df_stat = compute_statistical_features(con)
+    con.execute("CREATE TABLE feat_stat AS SELECT * FROM df_stat")
+    print(f"✅ Saved {len(df_stat):,} statistical features to 'feat_stat' table in {args.db}")
+
+if __name__ == "__main__":
+    main()
